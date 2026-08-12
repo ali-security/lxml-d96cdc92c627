@@ -22,6 +22,108 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 import versioninfo
 import setupinfo
 
+
+def disable_msvc_ltcg():
+    """Keep MSVC out of link-time code generation on Windows.
+
+    The prebuilt static libs that buildlibxml.py downloads from
+    lxml/libxml2-win-binaries contain '/GL' (whole program optimization) objects
+    that were produced by a different MSVC than the one running here, so pulling
+    them into an LTCG pass fails with
+
+        fatal error C1047: The object or library file '...' was created by a
+        different version of the compiler than other objects
+
+    distutils compiles with '/GL' and links with '/LTCG' by default.  Appending
+    '/GL-' or '/LTCG:OFF' does NOT help, because distutils puts its own '/LTCG'
+    at the FRONT of the link line, where it wins over a trailing override -- the
+    flags have to be removed from the compiler's own defaults instead.
+
+    This hooks MSVCCompiler.initialize(), which runs after the compiler picked up
+    its environment, so it keeps working when DISTUTILS_USE_SDK is set (in that
+    case _get_vc_env() short-circuits to the ambient vcvarsall environment and
+    initialize() still installs the same default flag lists afterwards).
+    """
+    compiler_classes = []
+    # Python 2.7's distutils has no '_msvccompiler'; its MSVC support lives in
+    # 'distutils.msvc9compiler', whose default compile_options also carry '/GL'.
+    for module_name in ('distutils._msvccompiler', 'setuptools._distutils._msvccompiler',
+                        'distutils.msvc9compiler'):
+        try:
+            module = __import__(module_name, {}, {}, ['MSVCCompiler'])
+        except ImportError:
+            continue
+        compiler_class = getattr(module, 'MSVCCompiler', None)
+        if compiler_class is not None and not any(compiler_class is seen for seen in compiler_classes):
+            compiler_classes.append(compiler_class)
+
+    def make_initialize(original_initialize):
+        def initialize(self, *args, **kwargs):
+            original_initialize(self, *args, **kwargs)
+            for attr_name in dir(self):
+                if attr_name.startswith('compile_options'):
+                    what = '/GL'
+                elif attr_name.startswith('ldflags_'):
+                    what = '/LTCG'
+                else:
+                    continue
+                try:
+                    flags = getattr(self, attr_name)
+                except Exception:
+                    continue
+                if not isinstance(flags, list):
+                    continue
+                kept = [flag for flag in flags if not str(flag).startswith(what)]
+                if len(kept) != len(flags):
+                    setattr(self, attr_name, kept)
+                    print("NOTE: removed %s from MSVC '%s'" % (what, attr_name))
+
+            # Force the dynamic CRT on 32-bit interpreters.  Python 3.6's
+            # distutils._msvccompiler cannot find the vcruntime redist that
+            # ships with Visual Studio 18 / MSVC 14.44, so it takes its
+            # static-CRT fallback: it compiles with '/MT' and links with
+            # '/nodefaultlib:libucrt.lib' + 'ucrt.lib'.  On x86 that pulls in
+            # MSVCRT.lib(chandler4gs.obj), which needs __except_handler4_common
+            # from the dynamic CRT, and the link dies with LNK2001/LNK1120.
+            # Every leg that compiles with '/MD' links fine, so put this one
+            # back on the same dynamic-CRT flags.  On x64 the static fallback
+            # links without complaint but silently yields extensions that import
+            # no VCRUNTIME140.dll, while the published cp36 win_amd64 wheel does
+            # - hence keying on the interpreter as well as on the bitness.
+            if sys.version_info[:2] == (3, 6) or sys.maxsize <= 2**32:
+                crt_replacements = {'/MT': '/MD', '/MTd': '/MDd'}
+                drop_ldflags = ('/nodefaultlib:libucrt.lib', 'ucrt.lib')
+                for attr_name in dir(self):
+                    if not (attr_name.startswith('compile_options')
+                            or attr_name.startswith('ldflags_')):
+                        continue
+                    try:
+                        flags = getattr(self, attr_name)
+                    except Exception:
+                        continue
+                    if not isinstance(flags, list):
+                        continue
+                    if attr_name.startswith('compile_options'):
+                        kept = [crt_replacements.get(str(flag), flag) for flag in flags]
+                        what = 'static CRT flags'
+                    else:
+                        kept = [flag for flag in flags
+                                if str(flag).lower() not in drop_ldflags]
+                        what = 'static CRT ucrt overrides'
+                    if kept != flags:
+                        setattr(self, attr_name, kept)
+                        print("NOTE: removed %s from MSVC '%s'" % (what, attr_name))
+        return initialize
+
+    for compiler_class in compiler_classes:
+        compiler_class.initialize = make_initialize(compiler_class.initialize)
+        print("NOTE: patched %s.MSVCCompiler to build without /GL and link without /LTCG"
+              % compiler_class.__module__)
+
+
+if sys.platform == 'win32':
+    disable_msvc_ltcg()
+
 # override these and pass --static for a static build. See
 # doc/build.txt for more information. If you do not pass --static
 # changing this will have no effect.

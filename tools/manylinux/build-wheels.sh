@@ -16,6 +16,20 @@ build_wheel() {
     source="$2"
     [ -n "$source" ] || source=/io
 
+    # bdist_wheel stamps its own version into the wheel's 'Generator:' field, so
+    # the ambient 'wheel' of each manylinux image decides artifact parity.  Most
+    # images already ship what the published lxml 4.9.4 wheels carry, so this
+    # only overrides where the image drifted: WHEEL_VERSION_PY37PLUS is set (from
+    # the Makefile, per image) for those, and left empty everywhere else so the
+    # matching ambient version is used untouched.  There is no pyproject.toml, so
+    # 'pip wheel' takes the legacy non-isolated path and this install is what
+    # actually builds the wheel.
+    if [ -n "$WHEEL_VERSION_PY37PLUS" ] \
+       && [ "$(${pybin}/python -c 'import sys; print(sys.version_info[:2] >= (3, 7))')" = "True" ]; then
+        ${pybin}/python -m pip install "wheel==$WHEEL_VERSION_PY37PLUS" || exit 1
+    fi
+    ${pybin}/python -m pip show wheel | grep -i '^Version:'
+
     env STATIC_DEPS=true \
         RUN_TESTS=true \
         LDFLAGS="$LDFLAGS -fPIC" \

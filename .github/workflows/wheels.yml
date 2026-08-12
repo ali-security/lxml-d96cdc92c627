@@ -1,17 +1,17 @@
 name: Wheel build
 
 on:
-  release:
-    types: [created]
+  workflow_dispatch:
 
 permissions: {}
 
 jobs:
   sdist:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     permissions:
-      contents: write
+      contents: read
 
     steps:
     - uses: actions/checkout@v4
@@ -19,41 +19,39 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.x"
+        # "3.x" resolves to CPython 3.14, for which the pre-generated C sources
+        # of Cython 0.29.37 do not compile.
+        python-version: "3.12"
 
     - name: Install lib dependencies
-      run: sudo apt-get update -y -q && sudo apt-get install -y -q "libxml2=2.9.13*" "libxml2-dev=2.9.13*" libxslt1.1 libxslt1-dev
+      run: sudo apt-get update -y -q && sudo apt-get install -y -q libxml2 libxml2-dev libxslt1.1 libxslt1-dev
 
     - name: Install Python dependencies
-      run: python -m pip install -U pip setuptools && python -m pip install -U docutils pygments sphinx sphinx-rtd-theme -r requirements.txt
+      # The setuptools pin comes last so that nothing can drag a 2026 setuptools
+      # back in: setup.py uses pkg_resources.parse_requirements(), which was
+      # removed in setuptools 81, and a plain '-U setuptools' lands exactly that.
+      run: |
+        python -m pip install -U pip
+        python -m pip install -U docutils pygments sphinx sphinx-rtd-theme -r requirements.txt
+        python -m pip install --force-reinstall --upgrade "setuptools<70"
 
     - name: Build docs and sdist
       run: make html sdist
       env: { STATIC_DEPS: false }
 
-    - name: Release
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: dist/*.tar.gz
-
     - name: Upload sdist
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: sdist
         path: dist/*.tar.gz
 
-    - name: Upload website
-      uses: actions/upload-artifact@v3
-      with:
-        name: website
-        path: doc/html
-
   Linux:
-    runs-on: ubuntu-latest
+    # aarch64 wheels are built on native ARM runners instead of under QEMU.
+    runs-on: ${{ contains(matrix.image, 'aarch64') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 120
 
     permissions:
-      contents: write
+      contents: read
 
     strategy:
       # Allows for matrix sub-jobs to fail without canceling the rest
@@ -92,8 +90,8 @@ jobs:
             pyversion: "cp311*"
           - image: manylinux_2_28_aarch64
             pyversion: "cp311*"
-          - image: manylinux_2_24_aarch64
-            pyversion: "cp312*"
+          # NOTE: the archived manylinux_2_24_aarch64 image has no /opt/python/cp312*
+          # and lxml never published a cp312 manylinux_2_24 wheel, so that leg is gone.
           - image: manylinux_2_28_aarch64
             pyversion: "cp312*"
 
@@ -121,10 +119,14 @@ jobs:
         python-version: "3.11"
 
     - name: Install lib dependencies
-      run: sudo apt-get update -y -q && sudo apt-get install -y -q "libxml2=2.9.13*" "libxml2-dev=2.9.13*" libxslt1.1 libxslt1-dev
+      run: sudo apt-get update -y -q && sudo apt-get install -y -q libxml2 libxml2-dev libxslt1.1 libxslt1-dev
 
     - name: Install dependencies
-      run: python -m pip install -r requirements.txt
+      # The setuptools pin comes last: setup.py uses
+      # pkg_resources.parse_requirements(), removed in setuptools 81.
+      run: |
+        python -m pip install -r requirements.txt
+        python -m pip install --force-reinstall --upgrade "setuptools<70"
 
     - name: Build sdist
       run: make sdist
@@ -134,26 +136,24 @@ jobs:
       run: make wheel_${{ matrix.image }}
       env: { STATIC_DEPS: true, PYTHON_BUILD_VERSION: "${{ matrix.pyversion }}" }
 
-    - name: Release
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: wheelhouse/*/*-m*linux*.whl  # manylinux / musllinux
-
     - name: Upload wheels
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.image }}
+        # upload-artifact@v4 rejects '*' in artifact names, and matrix.pyversion
+        # is literally "*"/"cp312*", so key the name on the matrix job index.
+        name: wheels-${{ matrix.image }}-${{ strategy.job-index }}
         path: wheelhouse/*/*-m*linux*.whl  # manylinux / musllinux
         if-no-files-found: ignore
 
   non-Linux:
+    timeout-minutes: 120
+
     strategy:
       # Allows for matrix sub-jobs to fail without canceling the rest
       fail-fast: false
 
       matrix:
-        os: [macos-latest, windows-2019]
+        os: [macos-latest, windows-latest]
         #os: [macos-10.15, windows-latest]
         #os: [macos-10.15]
         python-version:
@@ -169,17 +169,36 @@ jobs:
           - "pypy-3.9-v7.3.12"
           - "pypy-3.10-v7.3.13"
 
+        # lxml 4.9.4 published a *-win32.whl next to every *-win_amd64.whl for
+        # cp36-cp312, so 32-bit Windows is a real matrix DIMENSION.  It cannot be
+        # an 'include' entry: an include object whose keys all match a generated
+        # leg merges into that leg instead of adding one, which would convert the
+        # x64 leg into an x86 leg rather than adding a second leg.
+        architecture: [x64, x86]
+
         #include:
         #  - os: windows-2016
         #    python-version: 2.7
         exclude:
-          - os: windows-2019
-            python-version: 2.7  # needs older image
+          - os: macos-latest
+            python-version: 2.7  # no Python 2.7 interpreter for current macOS
+          # macOS has no 32-bit interpreter, and lxml published no 32-bit macOS wheel.
+          - os: macos-latest
+            architecture: x86
+          # setup-python ships no 32-bit PyPy for Windows.
+          - python-version: "pypy-3.8-v7.3.7"
+            architecture: x86
+          - python-version: "pypy-3.9-v7.3.12"
+            architecture: x86
+          - python-version: "pypy-3.10-v7.3.13"
+            architecture: x86
 
-    runs-on: ${{ matrix.os }}
+    # Only cp311/cp312 published universal2 macOS wheels; everything else (including
+    # all PyPy legs, which have no arm64 build at all) published macosx_11_0_x86_64.
+    runs-on: ${{ (matrix.os == 'macos-latest' && !contains(fromJSON('["3.11","3.12"]'), matrix.python-version)) && 'macos-15-intel' || matrix.os }}
 
     permissions:
-      contents: write
+      contents: read
 
     env: { LIBXML2_VERSION: 2.10.3, LIBXSLT_VERSION: 1.1.39, MACOSX_DEPLOYMENT_TARGET: 11.0 }
 
@@ -191,29 +210,353 @@ jobs:
       if: startsWith(matrix.python-version, '3.') || startsWith(matrix.python-version, 'pypy')
       with:
         python-version: ${{ matrix.python-version }}
+        # Pin the interpreter architecture on Windows only (x64 / x86 -> win_amd64
+        # / win32 wheels).  On macOS the value stays empty so setup-python keeps
+        # using the runner's own architecture: the 3.11/3.12 legs run on arm64
+        # macos-latest and must stay universal2, which an explicit 'x64' would
+        # silently turn into an x86_64-only build.
+        architecture: ${{ matrix.os == 'windows-latest' && matrix.architecture || '' }}
+
+    - name: Set up Python 2.7 (Windows)
+      # setup-python has no Python 2.7 build, so install the last official 2.7
+      # release (2.7.18) straight from python.org.  The .msi comes in two
+      # separate bitnesses, which is exactly why chocolatey is not used here:
+      # 'choco install python2' only ever lays down the x64 build and would
+      # silently turn the win32 leg into a second win_amd64 leg.
+      if: runner.os == 'Windows' && matrix.python-version == '2.7'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        if ("${{ matrix.architecture }}" -eq "x86") {
+          $msiUrl = "https://www.python.org/ftp/python/2.7.18/python-2.7.18.msi"
+          $pyDir = "C:\Python27-x86"
+        } else {
+          $msiUrl = "https://www.python.org/ftp/python/2.7.18/python-2.7.18.amd64.msi"
+          $pyDir = "C:\Python27-x64"
+        }
+        Write-Host "Installer: $msiUrl"
+        Write-Host "Target directory: $pyDir"
+
+        $tempDir = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+        $msiFile = Join-Path $tempDir "python-2.7.18.msi"
+        Invoke-WebRequest -Uri $msiUrl -OutFile $msiFile
+        Write-Host "Downloaded $((Get-Item $msiFile).Length) bytes to $msiFile"
+
+        $msiArgs = @(
+          "/i", "`"$msiFile`"",
+          "/qn",
+          "TARGETDIR=`"$pyDir`"",
+          "ALLUSERS=1",
+          "ADDLOCAL=DefaultFeature,Extensions,TclTk,Documentation,Tools,PrependPath"
+        )
+        $proc = Start-Process -FilePath "msiexec" -ArgumentList $msiArgs -Wait -PassThru
+        if ($proc.ExitCode -ne 0) {
+          Write-Host "ERROR: msiexec failed with exit code $($proc.ExitCode)"
+          exit 1
+        }
+
+        $pyExe = Join-Path $pyDir "python.exe"
+        if (-not (Test-Path $pyExe)) {
+          Write-Host "ERROR: $pyExe does not exist after installation. Contents of ${pyDir}:"
+          if (Test-Path $pyDir) { Get-ChildItem $pyDir | ForEach-Object { Write-Host "  $($_.Name)" } } else { Write-Host "  ($pyDir is missing)" }
+          exit 1
+        }
+        # Prove the bitness in the log: 32bit for the x86 leg, 64bit for x64.
+        & "$pyExe" -c "import sys, platform; print(sys.version); print(platform.architecture())"
+        if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: the installed interpreter failed to run"; exit 1 }
+
+        # GITHUB_PATH entries are PREPENDED to PATH for the following steps, so
+        # this 2.7 interpreter wins over the runner's ambient 'python'.
+        Add-Content -Path $env:GITHUB_PATH -Value "$pyDir"
+        Add-Content -Path $env:GITHUB_PATH -Value "$pyDir\Scripts"
+        Write-Host "Prepended to GITHUB_PATH: $pyDir"
+        Write-Host "Prepended to GITHUB_PATH: $pyDir\Scripts"
+
+        # pip 20.3.4 (the last "pip<21"), setuptools 44.1.1 and wheel 0.37.1 are
+        # the final Python-2.7-compatible releases.  wheel 0.37.1 is also the
+        # exact 'Generator:' recorded in the published lxml 4.9.4 wheels, so this
+        # pin is required for artifact parity, not merely for compatibility.
+        # get-pip.py runs pip internally, so an ambient PIP_INDEX_URL
+        # time-machine index is honoured on its own - do not override it.
+        $getPip = Join-Path $tempDir "get-pip.py"
+        Invoke-WebRequest -Uri "https://bootstrap.pypa.io/pip/2.7/get-pip.py" -OutFile $getPip
+        & "$pyExe" "$getPip" "pip<21" "setuptools==44.1.1" "wheel==0.37.1"
+        if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: get-pip.py failed with exit code $LASTEXITCODE"; exit 1 }
+        & "$pyExe" -m pip --version
+
+    - name: Install VS 9.0 for Python 2.7 (Windows)
+      # The published cp27 wheels' extension modules import MSVCR90.dll, so they
+      # were built with VS 2008 / MSVC 9.0 - the official CPython 2.7 extension
+      # toolchain.  Microsoft's "Visual C++ Compiler Package for Python 2.7" is
+      # that compiler; its original download.microsoft.com URL now 404s, so the
+      # Web Archive copy below is the only remaining source.
+      #
+      # ALLUSERS=1 is load-bearing, not a preference: a machine-wide install
+      # writes HKLM\...\Microsoft\DevDiv\VCForPython\9.0 (and its Wow6432Node
+      # view), and the setuptools 44.1.1 pinned above monkeypatches
+      # distutils.msvc9compiler.find_vcvarsall to read that key's 'installdir'.
+      # distutils therefore locates vcvarsall.bat by itself - which is why
+      # DISTUTILS_USE_SDK/MSSdk stay unset here and vcvarsall is never invoked
+      # directly: either would divert the build to the modern CRT.
+      if: runner.os == 'Windows' && matrix.python-version == '2.7'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        # The '/web/<timestamp>id_/' form returns the archived bytes verbatim.  A
+        # bare '/web/2020/' URL instead 302s to the snapshot and hands back a
+        # ~10 kB HTML interstitial, which msiexec rejects with error 1620
+        # ("failed to open the installation package").
+        $msiUrl = "https://web.archive.org/web/20210106040224id_/https://download.microsoft.com/download/7/9/6/796EF2E4-801B-4FC4-AB28-B59FBF6D907B/VCForPython27.msi"
+        $tempDir = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+        $msiFile = Join-Path $tempDir "VCForPython27.msi"
+        Write-Host "Installer: $msiUrl"
+        Invoke-WebRequest -Uri $msiUrl -OutFile $msiFile
+        $msiSize = (Get-Item $msiFile).Length
+        Write-Host "Downloaded $msiSize bytes to $msiFile"
+        # Catch an interstitial or truncated body here rather than as a
+        # confusing msiexec error code.
+        $expectedSize = 87891968
+        if ($msiSize -ne $expectedSize) {
+          Write-Host "ERROR: expected $expectedSize bytes, got $msiSize - not the MSI."
+          exit 1
+        }
+
+        $msiArgs = @("/i", "`"$msiFile`"", "/qn", "ALLUSERS=1")
+        $proc = Start-Process -FilePath "msiexec" -ArgumentList $msiArgs -Wait -PassThru
+        if ($proc.ExitCode -ne 0) {
+          Write-Host "ERROR: msiexec failed with exit code $($proc.ExitCode)"
+          exit 1
+        }
+
+        # Prove the install really happened: a silently skipped MSI would only
+        # surface as a wrong-CRT wheel at the end of a ~40 minute run.
+        $installDir = $null
+        foreach ($key in @(
+            "HKLM:\Software\Microsoft\DevDiv\VCForPython\9.0",
+            "HKLM:\Software\Wow6432Node\Microsoft\DevDiv\VCForPython\9.0")) {
+          if (Test-Path $key) {
+            $value = (Get-ItemProperty -Path $key).installdir
+            if ($value) {
+              Write-Host "Registry $key -> installdir = $value"
+              if (-not $installDir) { $installDir = $value }
+            }
+          } else {
+            Write-Host "Registry $key is absent"
+          }
+        }
+
+        $layoutDir = Join-Path ${env:ProgramFiles(x86)} "Common Files\Microsoft\Visual C++ for Python\9.0"
+        if (-not $installDir -and (Test-Path $layoutDir)) {
+          Write-Host "Falling back to the well-known layout: $layoutDir"
+          $installDir = $layoutDir
+        }
+
+        $vcvarsall = if ($installDir) { Join-Path $installDir "vcvarsall.bat" } else { $null }
+        if (-not $vcvarsall -or -not (Test-Path $vcvarsall)) {
+          Write-Host "ERROR: vcvarsall.bat of VS 9.0 not found (installdir = '$installDir')."
+          $searchRoot = Join-Path ${env:ProgramFiles(x86)} "Common Files\Microsoft"
+          Write-Host "Contents of ${searchRoot}:"
+          if (Test-Path $searchRoot) {
+            Get-ChildItem -Recurse -Depth 2 $searchRoot | ForEach-Object { Write-Host "  $($_.FullName)" }
+          } else {
+            Write-Host "  ($searchRoot is missing)"
+          }
+          exit 1
+        }
+        Write-Host "Found VS 9.0 vcvarsall.bat: $vcvarsall"
 
     - name: Install MacOS dependencies
       if: startsWith(runner.os, 'mac')
       run: |
-        brew install automake libtool
+        # ghcr.io intermittently 500s on a bottle blob and takes the leg down;
+        # retry the install before giving up.
+        for attempt in 1 2 3; do
+          brew install automake libtool && break
+          echo "brew install failed (attempt $attempt/3); retrying"
+          sleep $((10 * attempt))
+        done
+        command -v automake
         ln -s /usr/local/bin/glibtoolize /usr/local/bin/libtoolize
 
+    - name: Pin the macOS wheel platform tag
+      # setup-python's x86_64 CPython 3.8/3.9/3.10 builds carry a
+      # MACOSX_DEPLOYMENT_TARGET of 13.0/15.0 and distutils refuses to lower it,
+      # so the job-level MACOSX_DEPLOYMENT_TARGET is ignored and the wheels get
+      # tagged macosx_13_0/macosx_15_0.  sysconfig.get_platform() honours
+      # _PYTHON_HOST_PLATFORM.  Never set this on the other legs: the mere
+      # presence of the variable makes get_platform() return "".
+      #
+      # PyPy is excluded: its extensions record the distutils build directory
+      # (build/lib.macosx-<platform>-pypyXY) inside the .so, and the published
+      # PyPy wheels carry PyPy's native 'macosx-10.9-x86_64' there while still
+      # being TAGGED macosx_11_0.  bdist_wheel computes that tag separately and
+      # raises it from the job-level MACOSX_DEPLOYMENT_TARGET (11.0 > 10.9 is a
+      # raise, which distutils permits), so the PyPy legs reach the published
+      # filename without this override - and setting it would rewrite the
+      # embedded build path.
+      if: runner.os == 'macOS' && runner.arch == 'X64' && !startsWith(matrix.python-version, 'pypy')
+      run: echo "_PYTHON_HOST_PLATFORM=macosx-11.0-x86_64" >> $GITHUB_ENV
+
+    - name: Use PyPy's stdlib distutils on the pypy-3.8/3.9 macOS legs
+      # The .so records the distutils build directory.  setuptools' bundled
+      # _distutils names it from sys.implementation.cache_tag ("pypy38"), while
+      # the published pp38/pp39 macOS wheels carry "3.8"/"3.9" - the old
+      # distutils naming (sys.version[:3]).  PyPy's own stdlib distutils still
+      # uses the old scheme, so route those legs to it.  Verified against the
+      # reference wheels: pp38 -> lib.macosx-10.7-x86_64-3.8,
+      # pp39 -> lib.macosx-10.9-x86_64-3.9, but pp310 ->
+      # lib.macosx-10.9-x86_64-pypy310, so pypy-3.10 must keep the bundled
+      # _distutils and is deliberately excluded here.
+      if: runner.os == 'macOS' && (startsWith(matrix.python-version, 'pypy-3.8') || startsWith(matrix.python-version, 'pypy-3.9'))
+      run: echo "SETUPTOOLS_USE_DISTUTILS=stdlib" >> $GITHUB_ENV
+
     - name: Install dependencies
-      run: python -m pip install setuptools wheel -r requirements.txt
+      # The setuptools pin comes last: setup.py uses
+      # pkg_resources.parse_requirements(), removed in setuptools 81.
+      #
+      # 'wheel' must be pinned, not resolved: bdist_wheel stamps its own version
+      # into the wheel's 'Generator:' field, and the published lxml 4.9.4 wheels
+      # carry 0.42.0 on every cp37+/PyPy leg and 0.37.1 on the cp36 legs.  An
+      # unpinned install lands a current wheel (0.48.0) and breaks that parity.
+      if: matrix.python-version != '2.7'
+      shell: bash
+      run: |
+        if [ "${{ matrix.python-version }}" = "3.6" ]; then
+          WHEEL_VERSION=0.37.1
+        else
+          WHEEL_VERSION=0.42.0
+        fi
+        python -m pip install "wheel==$WHEEL_VERSION" -r requirements.txt
+        python -m pip install --force-reinstall --upgrade "setuptools<70"
+        python -m pip show wheel | grep -i '^Version:'
+
+    - name: Install dependencies (Python 2.7)
+      # 'setuptools<70' has no Python-2.7-compatible sdist that builds, and an
+      # unpinned 'wheel' would drift off the 0.37.1 Generator the published
+      # lxml 4.9.4 wheels carry.  setuptools 44.1.1 and wheel 0.37.1 are already
+      # in place from the "Set up Python 2.7 (Windows)" step and must not be
+      # touched again, so this installs only requirements.txt's single entry.
+      if: matrix.python-version == '2.7'
+      run: |
+        python -m pip install "Cython==0.29.37"
+
+    - name: Use the MSVC 14.44 toolset
+      # The prebuilt static libs that buildlibxml.py downloads from
+      # lxml/libxml2-win-binaries contain /GL (whole program optimization)
+      # objects.  iconv_a.lib was compiled with MSVC 14.44
+      # (proven by iconv_a.pdb), so the link-time code generation pass must run
+      # with that same toolset, or the linker reports
+      #   fatal error C1047: The object or library file '...iconv_a.lib' was
+      #   created by a different version of the compiler than other objects
+      # DISTUTILS_USE_SDK makes distutils' _get_vc_env() short-circuit to this
+      # ambient environment instead of re-running vcvarsall with the newest
+      # toolset it can find.
+      #
+      # Excluded on 2.7: the published cp27 wheels' .pyd files import MSVCR90.dll,
+      # so those legs must compile with VS 9.0 (see "Install VS 9.0 for Python
+      # 2.7") and pull the matching vs2008 static libs.  Running this step there
+      # would put MSVC 14.44 on PATH and link the modern CRT instead.
+      if: runner.os == 'Windows' && matrix.python-version != '2.7'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vsSetup = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe"
+        if (-not (Test-Path $vswhere)) { Write-Host "ERROR: vswhere.exe not found at $vswhere"; exit 1 }
+
+        $installPath = (& $vswhere -products * -property installationPath | Select-Object -First 1)
+        if (-not $installPath) { Write-Host "ERROR: vswhere reported no Visual Studio installation"; exit 1 }
+        Write-Host "Visual Studio installation: $installPath"
+
+        $toolsRoot = Join-Path $installPath "VC\Tools\MSVC"
+        function Find-Toolset1444 {
+          if (-not (Test-Path $toolsRoot)) { return $null }
+          return (Get-ChildItem -Directory $toolsRoot | Where-Object { $_.Name -like "14.44.*" } | Sort-Object Name | Select-Object -Last 1)
+        }
+
+        $toolset = Find-Toolset1444
+        if (-not $toolset) {
+          Write-Host "MSVC 14.44 toolset is not installed - adding Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64"
+          & $vsSetup modify --installPath "$installPath" --add Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64 --quiet --norestart --nocache | Out-Null
+          $installerProcs = Get-Process -Name "setup", "vs_installer", "vs_installershell", "vs_installerservice" -ErrorAction SilentlyContinue
+          if ($installerProcs) { $installerProcs | Wait-Process -Timeout 3600 -ErrorAction SilentlyContinue }
+          $toolset = Find-Toolset1444
+        }
+        if (-not $toolset) {
+          Write-Host "ERROR: MSVC 14.44 toolset still unavailable. Installed toolsets:"
+          if (Test-Path $toolsRoot) { Get-ChildItem -Directory $toolsRoot | ForEach-Object { Write-Host "  $($_.Name)" } } else { Write-Host "  (none - $toolsRoot is missing)" }
+          exit 1
+        }
+        Write-Host "Using MSVC toolset $($toolset.Name)"
+
+        # Target the same bitness as the interpreter, taken from the matrix's own
+        # 'architecture' dimension (the value also handed to setup-python).
+        # 'x86' is the correct vcvarsall argument for a 32-bit target on an x64
+        # host - 'x86_amd64' would be the 32-bit-hosted compiler targeting 64-bit.
+        $arch = if ("${{ matrix.architecture }}" -eq "x86") { "x86" } else { "x64" }
+        Write-Host "vcvarsall target architecture: $arch"
+
+        $vcvarsall = Join-Path $installPath "VC\Auxiliary\Build\vcvarsall.bat"
+        if (-not (Test-Path $vcvarsall)) { Write-Host "ERROR: $vcvarsall not found"; exit 1 }
+
+        # Run vcvarsall in a cmd shell and dump the environment it produced.  The
+        # call goes through a generated .bat file to keep cmd.exe's quote-stripping
+        # rules out of the picture.
+        $tempDir = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+        $batFile = Join-Path $tempDir "capture_vcvars.bat"
+        $batLines = @(
+          "@echo off",
+          "call `"$vcvarsall`" $arch -vcvars_ver=14.44",
+          "if errorlevel 1 exit /b 1",
+          "set"
+        )
+        Set-Content -Path $batFile -Value $batLines -Encoding ASCII
+        $dump = & $batFile
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "ERROR: vcvarsall.bat failed with exit code $LASTEXITCODE"
+          $dump | ForEach-Object { Write-Host $_ }
+          exit 1
+        }
+
+        $required = @("PATH", "INCLUDE", "LIB", "LIBPATH", "VCToolsInstallDir", "VCINSTALLDIR", "WindowsSdkDir", "UCRTVersion", "WindowsSDKVersion", "VSCMD_ARG_TGT_ARCH")
+        $skipPrefixes = @("GITHUB_", "RUNNER_", "ACTIONS_")
+        $skipNames = @("PROMPT", "CD", "_", "PWD", "__VSCMD_PREINIT_PATH")
+        $seen = @{}
+        foreach ($line in $dump) {
+          if ($line -notmatch '^([A-Za-z_][A-Za-z0-9_()#.\-]*)=(.*)$') { continue }
+          $name = $Matches[1]
+          $value = $Matches[2]
+          if ($skipNames -contains $name.ToUpper()) { continue }
+          $skip = $false
+          foreach ($prefix in $skipPrefixes) { if ($name.ToUpper().StartsWith($prefix)) { $skip = $true } }
+          if ($skip) { continue }
+          Add-Content -Path $env:GITHUB_ENV -Value "$name=$value"
+          $seen[$name.ToUpper()] = $value
+        }
+
+        $missing = @($required | Where-Object { -not $seen.ContainsKey($_.ToUpper()) })
+        if ($missing.Count -gt 0) {
+          Write-Host "ERROR: vcvarsall did not export: $($missing -join ', ')"
+          $dump | ForEach-Object { Write-Host $_ }
+          exit 1
+        }
+        foreach ($name in $required) { Write-Host "$name=$($seen[$name.ToUpper()])" }
+
+        # Make setuptools/_distutils use the environment above verbatim instead of
+        # calling vcvarsall itself (which would pick the newest toolset again).
+        Add-Content -Path $env:GITHUB_ENV -Value "DISTUTILS_USE_SDK=1"
+        Add-Content -Path $env:GITHUB_ENV -Value "MSSdk=1"
 
     - name: Build wheels
       run: make wheel
       env: { STATIC_DEPS: true, RUN_TESTS: true }
 
-    - name: Release
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        files: dist/lxml-*.whl
-
     - name: Upload wheels
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.os }}
+        name: wheels-${{ matrix.os }}-${{ strategy.job-index }}
         path: dist/lxml-*.whl
         if-no-files-found: ignore

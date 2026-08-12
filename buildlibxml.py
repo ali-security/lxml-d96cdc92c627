@@ -1,6 +1,8 @@
 import json
 import os, re, sys, subprocess, platform
+import shutil
 import tarfile
+import time
 from distutils import log
 from contextlib import closing, contextmanager
 from ftplib import FTP
@@ -32,21 +34,49 @@ sys_platform = sys.platform
 # use pre-built libraries on Windows
 
 def download_and_extract_windows_binaries(destdir):
-    url = "https://api.github.com/repos/lxml/libxml2-win-binaries/releases?per_page=5"
-    releases, _ = read_url(
-        url,
-        accept="application/vnd.github+json",
-        as_json=True,
-        github_api_token=os.environ.get("GITHUB_API_TOKEN"),
-    )
+    # The published cp27 wheels link MSVCR90.dll, so the Python 2.7 legs compile
+    # with VS 9.0 and need prebuilt static libs built against that same CRT.
+    # Only Python 2.7 can be that interpreter here, hence the version check.
+    use_vs2008 = sys.version_info[0] < 3
 
-    max_release = {'tag_name': ''}
-    for release in releases:
-        if max_release['tag_name'] < release.get('tag_name', ''):
-            max_release = release
+    if use_vs2008:
+        # 2023.03.26 is the LAST libxml2-win-binaries release that still ships a
+        # complete 'vs2008' set (iconv 1.14, libxml2 2.10.3, libxslt 1.1.37,
+        # zlib 1.2.12, both bitnesses), so the tag has to be pinned: the
+        # newest-releases scan below reaches back only a few releases and never
+        # sees it.  Its libxml2 2.10.3 is also the LIBXML2_VERSION the wheel
+        # workflow declares, and its objects carry no LTCG, so linking them with
+        # the VS 9.0 compiler cannot raise "fatal error C1047".
+        release_tag = "2023.03.26"
+        release, _ = read_url(
+            "https://api.github.com/repos/lxml/libxml2-win-binaries/releases/tags/%s" % release_tag,
+            accept="application/vnd.github+json",
+            as_json=True,
+            github_api_token=os.environ.get("GITHUB_API_TOKEN"),
+        )
+    else:
+        # Python 3 builds with the ambient MSVC 14.44 toolset, so it needs the
+        # newest, modern-MSVC drop; pairing that toolset with a vs2008 drop is
+        # what would break the link-time code generation pass.
+        url = "https://api.github.com/repos/lxml/libxml2-win-binaries/releases?per_page=5"
+        releases, _ = read_url(
+            url,
+            accept="application/vnd.github+json",
+            as_json=True,
+            github_api_token=os.environ.get("GITHUB_API_TOKEN"),
+        )
 
-    url = "https://github.com/lxml/libxml2-win-binaries/releases/download/%s/" % max_release['tag_name']
-    filenames = [asset['name'] for asset in max_release.get('assets', ())]
+        release = {'tag_name': ''}
+        for candidate in releases:
+            if release['tag_name'] < candidate.get('tag_name', ''):
+                release = candidate
+        release_tag = release['tag_name']
+
+    print('Using libxml2-win-binaries release %s (%s build)' % (
+        release_tag, 'vs2008' if use_vs2008 else 'modern MSVC'))
+
+    url = "https://github.com/lxml/libxml2-win-binaries/releases/download/%s/" % release_tag
+    filenames = [asset['name'] for asset in release.get('assets', ())]
 
     # Check for native ARM64 build or the environment variable that is set by
     # Visual Studio for cross-compilation (same variable as setuptools uses)
@@ -57,17 +87,25 @@ def download_and_extract_windows_binaries(destdir):
     else:
         arch = "win32"
 
-    if sys.version_info < (3, 5):
-        arch = 'vs2008.' + arch
-
-    arch_part = '.' + arch + '.'
-    filenames = [filename for filename in filenames if arch_part in filename]
+    # Assets are named '<lib>-<version>[.vs2008].<arch>.zip', so the variant token
+    # sits between version and architecture and both must be matched together:
+    # the plain '.<arch>.' substring would otherwise also accept the vs2008 asset
+    # on a Python 3 leg (and vice versa).  find_max_version() is unaffected -
+    # its version pattern stops at the first non-digit group, so 'vs2008' can
+    # never be read as part of a version number.
+    variant_part = '.vs2008' if use_vs2008 else ''
+    arch_part = variant_part + '.' + arch + '.'
+    filenames = [
+        filename for filename in filenames
+        if arch_part in filename and (use_vs2008 or '.vs2008.' not in filename)
+    ]
 
     libs = {}
     for libname in ['libxml2', 'libxslt', 'zlib', 'iconv']:
-        libs[libname] = "%s-%s.%s.zip" % (
+        libs[libname] = "%s-%s%s.%s.zip" % (
             libname,
             find_max_version(libname, filenames),
+            variant_part,
             arch,
         )
 
@@ -81,12 +119,63 @@ def download_and_extract_windows_binaries(destdir):
             print('Using local copy of  "{}"'.format(srcfile))
         else:
             print('Retrieving "%s" to "%s"' % (srcfile, destfile))
-            urlcleanup()  # work around FTP bug 27973 in Py2.7.12+
-            urlretrieve(srcfile, destfile)
+            # github.com intermittently drops the connection mid-response on the
+            # hosted Windows runners (http.client.RemoteDisconnected), which took
+            # out three otherwise-identical legs of one matrix run.  Retry with
+            # linear backoff, unlinking any partial/error body first so the next
+            # attempt cannot unpack a truncated zip.  github.com also 503s this
+            # asset when ~20 Windows legs of the matrix request it at once, so
+            # back off for minutes, not seconds.
+            WINDOWS_DOWNLOAD_ATTEMPTS = 8
+            for attempt in range(1, WINDOWS_DOWNLOAD_ATTEMPTS + 1):
+                try:
+                    if os.path.exists(destfile):
+                        os.unlink(destfile)
+                    urlcleanup()  # work around FTP bug 27973 in Py2.7.12+
+                    urlretrieve(srcfile, destfile)
+                    break
+                except Exception as exc:
+                    if attempt == WINDOWS_DOWNLOAD_ATTEMPTS:
+                        raise
+                    print('Download of "%s" failed (attempt %d/%d): %s' % (
+                        srcfile, attempt, WINDOWS_DOWNLOAD_ATTEMPTS, exc))
+                    sys.stdout.flush()
+                    time.sleep(15 * attempt)
         d = unpack_zipfile(destfile, destdir)
+        duplicate_pdb_files(d)
         libs[libname] = d
 
     return libs
+
+
+def duplicate_pdb_files(extracted_dir):
+    """Make the debug info of the prebuilt Windows libs reachable under the name
+    that the object files actually reference.
+
+    The libiconv objects in the libxml2-win-binaries drop were compiled with
+    '...\\libiconv\\MSVC17\\x64\\lib\\libiconv_a.pdb', but the released zip file
+    ships that file as 'iconv_a.pdb'.  The linker therefore fails with
+    "fatal error C1090: PDB API call failed, error code '5'" on the missing
+    'libiconv_a.pdb'.  Provide a copy under the referenced name.  Never delete
+    any '*.pdb' - the linker wants them.
+    """
+    lib_dir = os.path.join(extracted_dir, 'lib')
+    if not os.path.isdir(lib_dir):
+        return
+    for filename in os.listdir(lib_dir):
+        if not filename.endswith('_a.pdb') or filename.startswith('lib'):
+            continue
+        source = os.path.join(lib_dir, filename)
+        target = os.path.join(lib_dir, 'lib' + filename)
+        if os.path.exists(target):
+            print('Keeping existing "%s"' % target)
+            continue
+        try:
+            shutil.copy2(source, target)
+        except Exception as exc:
+            print('Failed to copy "%s" to "%s": %s' % (source, target, exc))
+        else:
+            print('Copied "%s" to "%s"' % (source, target))
 
 
 def find_top_dir_of_zipfile(zipfile):
@@ -137,9 +226,47 @@ def get_prebuilt_libxml2xslt(download_dir, static_include_dirs, static_library_d
 
 LIBXML2_LOCATION = 'https://download.gnome.org/sources/libxml2/'
 LIBXSLT_LOCATION = 'https://download.gnome.org/sources/libxslt/'
-LIBICONV_LOCATION = 'https://ftp.gnu.org/pub/gnu/libiconv/'
-ZLIB_LOCATION = 'https://zlib.net/'
+# ftp.gnu.org is a single point of failure: under CI-scale parallel load some
+# runners cannot reach it at all ("[Errno 101] Network is unreachable") and burn
+# every retry on the same host.  List GNU mirrors serving the identical tarball
+# so a leg can fail over instead of failing.
+LIBICONV_LOCATIONS = (
+    'https://ftp.gnu.org/pub/gnu/libiconv/',
+    'https://mirrors.kernel.org/gnu/libiconv/',
+    'https://ftpmirror.gnu.org/libiconv/',
+)
+# 'https://zlib.net/' only serves the CURRENT release, so a pinned version is a
+# guaranteed 404 there: try the fossils archive and the GitHub release assets
+# first and keep zlib.net as the last resort.
+ZLIB_LOCATIONS = (
+    'https://zlib.net/fossils/',
+    'https://github.com/madler/zlib/releases/download/v%s/',
+    'https://zlib.net/',
+)
+# The published lxml 4.9.4 wheels embed zlib 1.3 and libiconv 1.17.
+# zlib 1.3's pre-1.3.1 'fdopen' macro breaks the current macOS SDK
+# ("_stdio.h:322:7: error: expected identifier or '('"), so build 1.3.1 there.
+ZLIB_VERSION = '1.3.1' if sys.platform == 'darwin' else '1.3'
+LIBICONV_VERSION = '1.17'
 match_libfile_version = re.compile('^[^-]*-([.0-9-]+)[.].*').match
+
+# Magic bytes of the archive formats we download (gzip, bzip2, xz, zip).
+ARCHIVE_MAGIC_NUMBERS = (b'\x1f\x8b', b'BZh', b'\xfd7zXZ\x00', b'PK\x03\x04')
+DOWNLOAD_ATTEMPTS = 4
+
+
+def _is_archive_file(filename):
+    """Verify by magic bytes that a downloaded file really is an archive.
+
+    Both zlib.net (under CI-scale parallel load) and a failed urlretrieve() can
+    leave an HTML error body on disk under the archive's name.
+    """
+    try:
+        with open(filename, 'rb') as f:
+            header = f.read(8)
+    except (IOError, OSError):
+        return False
+    return any(header.startswith(magic) for magic in ARCHIVE_MAGIC_NUMBERS)
 
 
 def _find_content_encoding(response, default='iso8859-1'):
@@ -298,7 +425,9 @@ def download_libiconv(dest_dir, version=None):
     """Downloads libiconv, returning the filename where the library was downloaded"""
     version_re = re.compile(r'libiconv-([0-9.]+[0-9]).tar.gz')
     filename = 'libiconv-%s.tar.gz'
-    return download_library(dest_dir, LIBICONV_LOCATION, 'libiconv',
+    if version is None:
+        version = LIBICONV_VERSION
+    return download_library(dest_dir, LIBICONV_LOCATIONS, 'libiconv',
                             version_re, filename, version=version)
 
 
@@ -306,7 +435,9 @@ def download_zlib(dest_dir, version):
     """Downloads zlib, returning the filename where the library was downloaded"""
     version_re = re.compile(r'zlib-([0-9.]+[0-9]).tar.gz')
     filename = 'zlib-%s.tar.gz'
-    return download_library(dest_dir, ZLIB_LOCATION, 'zlib',
+    if version is None:
+        version = ZLIB_VERSION
+    return download_library(dest_dir, ZLIB_LOCATIONS, 'zlib',
                             version_re, filename, version=version)
 
 
@@ -331,13 +462,16 @@ def find_max_version(libname, filenames, version_re=None):
 
 
 def download_library(dest_dir, location, name, version_re, filename, version=None):
+    # 'location' may be a single URL or a sequence of mirrors to try in order.
+    locations = list(location) if isinstance(location, (list, tuple)) else [location]
     if version is None:
+        list_location = locations[0]
         try:
-            if location.startswith('ftp://'):
-                fns = remote_listdir(location)
+            if list_location.startswith('ftp://'):
+                fns = remote_listdir(list_location)
             else:
-                print(location)
-                fns = http_listfiles(location, '(%s)' % filename.replace('%s', '(?:[0-9.]+[0-9])'))
+                print(list_location)
+                fns = http_listfiles(list_location, '(%s)' % filename.replace('%s', '(?:[0-9.]+[0-9])'))
             version = find_max_version(name, fns, version_re)
         except IOError:
             # network failure - maybe we have the files already?
@@ -356,17 +490,55 @@ def download_library(dest_dir, location, name, version_re, filename, version=Non
                 raise
     if version:
         filename = filename % version
-    full_url = urljoin(location, filename)
     dest_filename = os.path.join(dest_dir, filename)
-    if os.path.exists(dest_filename):
+    if os.path.exists(dest_filename) and _is_archive_file(dest_filename):
         print(('Using existing %s downloaded into %s '
                '(delete this file if you want to re-download the package)') % (
             name, dest_filename))
-    else:
-        print('Downloading %s into %s from %s' % (name, dest_filename, full_url))
-        urlcleanup()  # work around FTP bug 27973 in Py2.7.12
-        urlretrieve(full_url, dest_filename)
-    return dest_filename
+        return dest_filename
+
+    # NOTE: the retries must wrap the download itself, not the version listing:
+    # with a pinned version the listing above is skipped entirely.
+    last_error = None
+    for loc in locations:
+        if '%s' in loc:
+            if not version:
+                continue  # this mirror needs the version in its URL
+            loc = loc % version
+        full_url = urljoin(loc, filename)
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            # A failed urlretrieve() leaves the HTTP error body behind under the
+            # archive's name, which would look like a reusable download later on.
+            if os.path.exists(dest_filename):
+                try:
+                    os.unlink(dest_filename)
+                except OSError as exc:
+                    print('Failed to remove "%s": %s' % (dest_filename, exc))
+            print('Downloading %s into %s from %s (attempt %d/%d)' % (
+                name, dest_filename, full_url, attempt, DOWNLOAD_ATTEMPTS))
+            try:
+                urlcleanup()  # work around FTP bug 27973 in Py2.7.12
+                urlretrieve(full_url, dest_filename)
+            except Exception as exc:
+                last_error = exc
+                print('Download failed: %s' % exc)
+            else:
+                if _is_archive_file(dest_filename):
+                    return dest_filename
+                # Some mirrors answer with an error page and a 200 status.
+                last_error = IOError(
+                    'Downloaded file from %s is not an archive file' % full_url)
+                print('Download failed: %s' % last_error)
+            time.sleep(attempt * 2)
+
+    if os.path.exists(dest_filename):
+        try:
+            os.unlink(dest_filename)
+        except OSError:
+            pass
+    if last_error is None:
+        last_error = IOError('Failed to download %s from %s' % (filename, locations))
+    raise last_error
 
 
 def unpack_tarball(tar_filename, dest):

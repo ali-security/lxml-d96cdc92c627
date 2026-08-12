@@ -1,16 +1,8 @@
 name: CI
 
+# Disabled: the wheel build in .github/workflows/wheels.yml is the single
+# build+test target (its wheel jobs run the test suite via RUN_TESTS/build-wheels.sh).
 on:
-  push:
-    paths:
-      - '**'
-      - '!.github/**'
-      - '.github/workflows/ci.yml'
-  pull_request:
-    paths:
-      - '**'
-      - '!.github/**'
-      - '.github/workflows/ci.yml'
   workflow_dispatch:
 
 concurrency:
@@ -22,6 +14,9 @@ permissions:
 
 jobs:
   ci:
+    # Disabled - see the comment on 'on:' above.
+    if: false
+
     strategy:
       # Allows for matrix sub-jobs to fail without canceling the rest
       fail-fast: false
@@ -190,7 +185,6 @@ jobs:
           key: ${{ runner.os }}-ccache${{ matrix.extra_hash }}-${{ matrix.python-version }}-${{ hashFiles('.github/workflows/ci.yml', 'tools/ci-run.sh') }}
 
       - name: Run CI
-        continue-on-error: ${{ matrix.allowed_failure || false }}
         env: ${{ matrix.env }}
         run: bash -c 'GITHUB_API_TOKEN="${{ secrets.GITHUB_TOKEN }}"  bash ./tools/ci-run.sh'
 
@@ -199,7 +193,7 @@ jobs:
         run: make html
 
       - name: Upload docs
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: matrix.extra_hash == '-docs'
         with:
           name: website_html
@@ -207,14 +201,14 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload Coverage Report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: pycoverage_html
           path: coverage*
           if-no-files-found: ignore
 
       - name: Upload Wheel
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: matrix.env.STATIC_DEPS == true  ||  matrix.env.STATIC_DEPS == 'true'
         with:
           name: wheels-${{ runner.os }}

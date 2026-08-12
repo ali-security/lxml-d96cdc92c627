@@ -18,6 +18,28 @@ MANYLINUX_LIBXSLT_VERSION=1.1.39
 MANYLINUX_CFLAGS=-O3 -g1 -pipe -fPIC -flto
 MANYLINUX_LDFLAGS=-flto
 
+# The quay.io/pypa images have drifted: ':latest' now ships gcc-toolset-14 (which
+# makes -Wincompatible-pointer-types a hard error in the libxml2/libxslt build),
+# adds cp313 and drops cp36-cp38.  Pin the drifted ones to a tag that still
+# matches what lxml 4.9.4 was published with.  The manylinux_2_24_* images are
+# archived, so ':latest' is the correct tag for those.
+IMAGE_TAG ?= latest
+IMAGE_TAG_manylinux2014_aarch64 = 2023-12-18-e7e3b8c
+IMAGE_TAG_manylinux_2_28_x86_64 = 2023-12-18-e7e3b8c
+IMAGE_TAG_manylinux_2_28_aarch64 = 2023-12-18-e7e3b8c
+IMAGE_TAG_musllinux_1_1_x86_64 = 2023-12-18-e7e3b8c
+IMAGE_TAG_musllinux_1_1_aarch64 = 2023-12-18-e7e3b8c
+
+# bdist_wheel records its version as the wheel's 'Generator:', so it has to match
+# the published artifact.  Every image's ambient 'wheel' already does EXCEPT the
+# archived manylinux1 pair, which ships 0.43.0 where lxml 4.9.4's cp37+ legs were
+# published with 0.42.0.  Set this only there - an image left unset keeps its own
+# ambient version, which is the value the reference wheels carry (0.38.4 on
+# manylinux_2_24, 0.42.0 on manylinux_2_28/musllinux).  The cp27/cp35/cp36 legs
+# are correct everywhere, hence the py37+ scoping in build-wheels.sh.
+WHEEL_VERSION_PY37PLUS_manylinux1_x86_64 = 0.42.0
+WHEEL_VERSION_PY37PLUS_manylinux1_i686 = 0.42.0
+
 MANYLINUX_IMAGES= \
 	manylinux1_x86_64 \
 	manylinux1_i686 \
@@ -65,7 +87,8 @@ qemu-user-static:
 	docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
 wheel_manylinux: $(addprefix wheel_,$(MANYLINUX_IMAGES))
-$(addprefix wheel_,$(filter-out %_x86_64, $(filter-out %_i686, $(MANYLINUX_IMAGES)))): qemu-user-static
+# NOTE: aarch64 wheels are built on native ARM runners, so they must NOT depend
+# on the qemu-user-static target.
 
 wheel_%: dist/lxml-$(LXMLVERSION).tar.gz
 	time docker run --rm -t \
@@ -79,8 +102,10 @@ wheel_%: dist/lxml-$(LXMLVERSION).tar.gz
 		-e LIBXML2_VERSION="$(MANYLINUX_LIBXML2_VERSION)" \
 		-e LIBXSLT_VERSION="$(MANYLINUX_LIBXSLT_VERSION)" \
 		-e PYTHON_BUILD_VERSION="$(PYTHON_BUILD_VERSION)" \
+		-e PIP_INDEX_URL="$(PIP_INDEX_URL)" \
+		-e WHEEL_VERSION_PY37PLUS="$(WHEEL_VERSION_PY37PLUS_$(subst wheel_,,$@))" \
 		-e WHEELHOUSE=$(subst wheel_,wheelhouse/,$@) \
-		quay.io/pypa/$(subst wheel_,,$@) \
+		quay.io/pypa/$(subst wheel_,,$@):$(or $(IMAGE_TAG_$(subst wheel_,,$@)),$(IMAGE_TAG)) \
 		bash /io/tools/manylinux/build-wheels.sh /io/$<
 
 wheel:
